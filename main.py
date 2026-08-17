@@ -403,41 +403,48 @@ def fetch_ghmc_tenders_page():
 
 def parse_ghmc_tender_rows(html):
     # GHMC's tenders table is plain server-rendered HTML (not JS-rendered),
-    # each row has the work name as a link (usually to a PDF or detail page)
-    # alongside dates. Parsed with regex rather than a full HTML parser
-    # dependency, since the structure is a simple repeating <tr> table.
+    # each row has the work name plus one or more links. Parsed with regex
+    # rather than a full HTML parser dependency, since the structure is a
+    # simple repeating <tr> table.
     rows = []
     row_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.S | re.I)
     link_pattern = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S | re.I)
     cell_pattern = re.compile(r'<td[^>]*>(.*?)</td>', re.S | re.I)
+    # A real, genuinely-fetchable document link - not the row's OTHER links
+    # (view-detail postbacks, pagination controls, etc.) which live testing
+    # showed are javascript:__doPostBack(...) triggers, not real URLs. Only
+    # trust something that looks like an actual file/document path.
+    real_doc_pattern = re.compile(r'\.(pdf|doc|docx|xls|xlsx)(\?|$)|/documents?/', re.I)
 
     for row_html in row_pattern.findall(html):
         cells = cell_pattern.findall(row_html)
         if len(cells) < 3:
             continue
-        link_match = link_pattern.search(row_html)
         work_name = re.sub(r'<[^>]+>', '', cells[1] if len(cells) > 1 else "").strip()
         work_name = re.sub(r'\s+', ' ', work_name)
         if not work_name or work_name.lower() in ("name of the work", "t.type"):
             continue
+
+        # Check EVERY link in the row (not just the first) for a genuine
+        # document link - a row can have several links (detail postback,
+        # download postback, an actual file link) and the first one found
+        # isn't necessarily the real document.
         doc_url = None
-        if link_match:
-            href = link_match.group(1).strip()
-            # GHMC's site is ASP.NET WebForms - "download" links here are
-            # often javascript:__doPostBack(...) triggers, not real fetchable
-            # URLs. Blindly prepending the domain to any non-http href (the
-            # old behavior) turned these into garbage URLs like
-            # "https://www.ghmc.gov.in/javascript:__doPostBack(...)" that
-            # LOOK like real links (they start with "http") but actually
-            # crash the server with a security exception when opened - a
-            # real bug found via live testing. Explicitly exclude anything
-            # that isn't a genuine relative/absolute path.
+        for href, _link_text in link_pattern.findall(row_html):
+            href = href.strip()
             if href.lower().startswith("javascript:") or href.lower().startswith("#"):
-                doc_url = None
-            elif href.startswith("http"):
-                doc_url = href
-            else:
-                doc_url = "https://www.ghmc.gov.in/" + href.lstrip("/")
+                continue
+            if not real_doc_pattern.search(href):
+                continue
+            doc_url = href if href.startswith("http") else "https://www.ghmc.gov.in/" + href.lstrip("/")
+            break
+
+        # Per explicit request: only surface tenders that actually have a
+        # real, downloadable document attached - skip everything else
+        # rather than showing a broken/no-document entry.
+        if not doc_url:
+            continue
+
         # Use a stable hash of the work name as the id - GHMC's table has no
         # explicit tender/reference number column exposed in the HTML.
         tender_id = hashlib.sha256(work_name.encode()).hexdigest()[:16]
