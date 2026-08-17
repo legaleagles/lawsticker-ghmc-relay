@@ -423,7 +423,21 @@ def parse_ghmc_tender_rows(html):
         doc_url = None
         if link_match:
             href = link_match.group(1).strip()
-            doc_url = href if href.startswith("http") else "https://www.ghmc.gov.in/" + href.lstrip("/")
+            # GHMC's site is ASP.NET WebForms - "download" links here are
+            # often javascript:__doPostBack(...) triggers, not real fetchable
+            # URLs. Blindly prepending the domain to any non-http href (the
+            # old behavior) turned these into garbage URLs like
+            # "https://www.ghmc.gov.in/javascript:__doPostBack(...)" that
+            # LOOK like real links (they start with "http") but actually
+            # crash the server with a security exception when opened - a
+            # real bug found via live testing. Explicitly exclude anything
+            # that isn't a genuine relative/absolute path.
+            if href.lower().startswith("javascript:") or href.lower().startswith("#"):
+                doc_url = None
+            elif href.startswith("http"):
+                doc_url = href
+            else:
+                doc_url = "https://www.ghmc.gov.in/" + href.lstrip("/")
         # Use a stable hash of the work name as the id - GHMC's table has no
         # explicit tender/reference number column exposed in the HTML.
         tender_id = hashlib.sha256(work_name.encode()).hexdigest()[:16]
