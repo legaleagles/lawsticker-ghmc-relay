@@ -20,6 +20,7 @@ Required env vars: GEMINI_API_KEY, SITE_REPO_TOKEN, TELEGRAM_BOT_TOKEN,
 TELEGRAM_CHAT_ID (same values as the main backend's env vars).
 """
 from flask import Flask, jsonify
+from flask_cors import CORS
 import json
 import os
 import re
@@ -35,6 +36,9 @@ from datetime import datetime, timezone
 from pypdf import PdfReader
 
 app = Flask(__name__)
+CORS(app)  # the site (lawsticker-ai.com) calls this cross-origin from the
+           # browser, so CORS headers are required or the browser blocks
+           # the response client-side even though the server itself works fine
 
 REPO = "legaleagles/LabourLaw2"
 GITHUB_API = "https://api.github.com"
