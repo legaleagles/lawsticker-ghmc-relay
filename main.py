@@ -362,15 +362,19 @@ def _fetch_via_resolved_ip(url, user_agent, timeout=25):
     body = response[header_end + 4:]
     if " 200 " not in status_line:
         raise Exception(f"Unexpected HTTP status fetching GHMC page: {status_line.strip()}")
-    return body.decode("utf-8", errors="ignore")
+    return body  # raw bytes - caller decodes if it's text (HTML), or uses as-is if binary (PDF)
 
 
-def fetch_ghmc_tenders_page():
+def fetch_ghmc_url_hardened(url, timeout=25):
+    # Generalized version of the page-fetch hardening below - same
+    # native+IPv4+retry then DNS-over-HTTPS fallback, but works for ANY
+    # ghmc.gov.in URL (the tenders list page OR an individual tender's PDF),
+    # returning raw bytes so binary content isn't corrupted by text decoding.
+    # This replaces a separate, weaker fetch that individual PDF downloads
+    # were using (bare "lawsticker-ai-cron/1.0" User-Agent, no DoH fallback,
+    # no retry) - likely why PDF fetches were failing even when the tenders
+    # list itself fetched fine.
     user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-
-    # First try the normal path (fast, simple) with IPv4-forced native
-    # resolution and a short retry - covers the case where it really is just
-    # a transient blip this time.
     import socket
     import time
     original_getaddrinfo = socket.getaddrinfo
@@ -383,9 +387,13 @@ def fetch_ghmc_tenders_page():
     try:
         for attempt in range(2):
             try:
-                req = urllib.request.Request(GHMC_TENDERS_PAGE, headers={"User-Agent": user_agent})
-                with urllib.request.urlopen(req, timeout=25) as resp:
-                    return resp.read().decode("utf-8", errors="ignore")
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": user_agent,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                })
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read()
             except Exception as e:
                 last_error = e
                 if attempt == 0:
@@ -393,12 +401,14 @@ def fetch_ghmc_tenders_page():
     finally:
         socket.getaddrinfo = original_getaddrinfo
 
-    # Native resolution failed twice - fall back to DNS-over-HTTPS + a raw
-    # direct-IP request, bypassing the container's own DNS lookup entirely.
     try:
-        return _fetch_via_resolved_ip(GHMC_TENDERS_PAGE, user_agent)
+        return _fetch_via_resolved_ip(url, user_agent, timeout=timeout)
     except Exception as doh_error:
         raise Exception(f"Both native resolution and DNS-over-HTTPS fallback failed. Native: {last_error}. DoH: {doh_error}")
+
+
+def fetch_ghmc_tenders_page():
+    return fetch_ghmc_url_hardened(GHMC_TENDERS_PAGE).decode("utf-8", errors="ignore")
 
 
 def parse_ghmc_tender_rows(html):
@@ -465,6 +475,24 @@ def ghmc_connectivity_test():
         return jsonify({"ok": False, "reached_ghmc": False, "error": str(e)[:500]})
 
 
+@app.route('/api/ghmc-fetch-doc-test', methods=['GET'])
+def ghmc_fetch_doc_test():
+    # Lets a specific document URL be tested directly (e.g. one shown by
+    # /api/ghmc-tenders-list) without waiting for the cron job to pick it up
+    # - useful for confirming the hardened fetch actually retrieves a real
+    # PDF for a given tender's doc_url.
+    from flask import request
+    url = request.args.get("url", "")
+    if not url.startswith("https://www.ghmc.gov.in/") and not url.startswith("https://ghmc.gov.in/"):
+        return jsonify({"ok": False, "error": "url must be a ghmc.gov.in link"}), 400
+    try:
+        data = fetch_ghmc_url_hardened(url)
+        is_pdf = data.startswith(b"%PDF")
+        return jsonify({"ok": True, "is_pdf": is_pdf, "byte_count": len(data)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:500]})
+
+
 @app.route('/api/ghmc-tenders-list', methods=['GET'])
 def ghmc_tenders_list():
     # Public - GHMC's own tender listing is public data, this just returns
@@ -527,9 +555,7 @@ def ghmc_tender_watch():
             if not row["doc_url"]:
                 continue  # nothing to actually analyze without a document
             try:
-                doc_req = urllib.request.Request(row["doc_url"], headers={"User-Agent": "lawsticker-ai-cron/1.0"})
-                with urllib.request.urlopen(doc_req, timeout=25) as doc_resp:
-                    pdf_bytes = doc_resp.read()
+                pdf_bytes = fetch_ghmc_url_hardened(row["doc_url"])
                 if not pdf_bytes.startswith(b"%PDF"):
                     continue  # link wasn't actually a PDF (e.g. a detail page instead)
                 result = run_tender_anomaly_analysis(pdf_bytes, gemini_key)
@@ -575,7 +601,7 @@ def ghmc_tender_watch():
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "service": "lawsticker-ghmc-relay", "routes": [
-        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch",
+        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test",
     ]})
 
 
