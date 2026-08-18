@@ -583,8 +583,16 @@ def parse_tenderdetail_detail_page(html):
     # the whole parse. Returns None per field it can't find rather than
     # failing the whole extraction - partial detail is still useful.
     def find_value(label_pattern, text, max_gap=200):
-        m = re.search(label_pattern + r'.{0,' + str(max_gap) + r'}?</[^>]+>\s*<[^>]+>\s*([^<]{1,120})', text, re.S | re.I)
-        return m.group(1).strip() if m else None
+        # Wrap in a non-capturing group unconditionally - a bare top-level
+        # alternation in label_pattern (e.g. "A|B") would otherwise bind the
+        # appended suffix only to the LAST alternative, due to regex
+        # operator precedence. That was the actual crash: when only the
+        # first alternative matched, group(1) belonged to a branch that
+        # never ran, came back None, and .strip() on None raised.
+        m = re.search(r'(?:' + label_pattern + r')' + r'.{0,' + str(max_gap) + r'}?</[^>]+>\s*<[^>]+>\s*([^<]{1,120})', text, re.S | re.I)
+        if not m or m.group(1) is None:
+            return None
+        return m.group(1).strip() or None
 
     text = html
     result = {}
@@ -594,7 +602,7 @@ def parse_tenderdetail_detail_page(html):
     result["tender_value"] = find_value(r'Tender\s*Value\b', text)
     result["tender_fee"] = find_value(r'Tender\s*Fee\b', text)
     result["emd"] = find_value(r'\bEMD\b(?!\s*Exemption)', text)
-    result["emd_exemption"] = find_value(r'EMD\s*Exemption\b|Exemption\b', text)
+    result["emd_exemption"] = find_value(r'EMD\s*Exemption\b|\bExemption\b', text)
     result["competition_type"] = find_value(r'Competition\s*Type\b', text)
     result["bidding_type"] = find_value(r'Bidding\s*Type\b', text)
     result["city"] = find_value(r'\bCity\b', text)
@@ -630,6 +638,16 @@ def ghmc_tender_detail():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Could not fetch detail page: {str(e)[:300]}"}), 502
 
+    def content_sample(html):
+        # A slice starting at byte 0 just shows <head>/CSS links, which is
+        # useless for debugging the label->value markup pattern. Anchor on
+        # "Tender Value" instead (present on every real detail page, seen in
+        # both the Overview and Finance sections) and show the surrounding
+        # window where the actual fields live.
+        idx = html.lower().find("tender value")
+        start = max(0, idx - 100) if idx != -1 else 0
+        return html[start:start + 1500]
+
     try:
         detail, found_count = parse_tenderdetail_detail_page(html)
     except Exception as e:
@@ -644,7 +662,7 @@ def ghmc_tender_detail():
             "detail": {},
             "parse_error": str(e)[:300],
             "debug_html_len": len(html),
-            "debug_sample": html[:1200],
+            "debug_sample": content_sample(html),
         })
 
     response = {"ok": True, "detail": detail}
@@ -653,7 +671,7 @@ def ghmc_tender_detail():
         # endpoint, since this parser was also written without being able
         # to see this domain's raw HTML from this sandbox's own network.
         response["debug_html_len"] = len(html)
-        response["debug_sample"] = html[:1200]
+        response["debug_sample"] = content_sample(html)
     return jsonify(response)
 
 
