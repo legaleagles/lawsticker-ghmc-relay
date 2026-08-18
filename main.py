@@ -608,6 +608,26 @@ def parse_tenderdetail_detail_page(html):
     result["city"] = find_value(r'\bCity\b', text)
     result["state"] = find_value(r'\bState\b', text)
     result["authority_name"] = find_value(r'Authority\s*Name\b', text)
+    result["tender_type"] = find_value(r'Tender\s*Type\b', text)  # Online / Offline
+    result["quantity"] = find_value(r'\bQuantity\b', text)
+
+    # TDR number and document count sit in distinctive, low-ambiguity spots
+    # (a tab label and a reference-number badge) rather than a clean
+    # label:value pair, so these get their own small direct patterns instead
+    # of going through find_value.
+    tdr_match = re.search(r'TDR\s*#\s*(\d+)', text, re.I)
+    result["tdr_number"] = tdr_match.group(1) if tdr_match else None
+    # Anchored to the tab navigation specifically ("...Timeline Documents 2")
+    # since "Documents" alone appears in several unrelated spots on the page
+    # (a loose search risks matching the wrong number entirely).
+    doc_count_match = re.search(r'Timeline\s*Documents\s*(\d{1,3})\D', text, re.I)
+    if not doc_count_match:
+        doc_count_match = re.search(r'Documents\s*(\d{1,3})\D', text, re.I)
+    result["document_count"] = int(doc_count_match.group(1)) if doc_count_match else None
+    result["document_fee_refundable"] = (
+        "Non-refundable" if re.search(r'Non-refundable', text, re.I)
+        else ("Refundable" if re.search(r'(?<!Non-)Refundable', text, re.I) else None)
+    )
 
     # Corrigendum table - each row is a date + optional new-submission-date;
     # frequency/recency of corrigendums is itself a useful signal (repeated
