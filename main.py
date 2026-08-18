@@ -276,6 +276,25 @@ def log_tender_scrutiny_result(site_token, tender_name, result, source="manual")
 GHMC_TENDERS_PAGE = "https://www.ghmc.gov.in/Tenderspage.aspx"
 GHMC_SEEN_TENDERS_FILE = "ghmc-seen-tenders.json"
 
+# ghmc.gov.in's own listing carries no Patancheru-area data at all (confirmed
+# via testing - it's a small unrelated "General quotations" table). Real
+# Patancheru/Ameenpur-circle tenders live on the state eProcurement system,
+# which tenderdetail.com mirrors into a plain static page under the GHMC
+# authority tag (still true even after GHMC's Feb-2026 three-way split into
+# GHMC/Cyberabad Municipal Corporation/Malkajgiri - aggregator tagging hasn't
+# fully caught up to that yet, so filtering by place-name in the title is
+# more reliable right now than filtering by authority name).
+TENDERDETAIL_GHMC_PAGES = [
+    f"https://www.tenderdetail.com/government-tenders/tenders-for-greater-hyderabad-municipal-corporation/{n}?agid=3036"
+    for n in (1, 2, 3)
+]
+PATANCHERU_AREA_KEYWORDS = (
+    "patancheru", "pattancheru", "patancheruvu", "ameenpur", "ramachandrapuram",
+    "rc puram", "r.c.puram", "beeramguda", "bollaram", "bollarum", "tellapur",
+    "muthangi", "circle-45", "circle-46", "circle-47", "circle 45", "circle 46",
+    "circle 47", "circle-49", "circle 49", "slpz", "serilingampally",
+)
+
 
 def _resolve_via_doh(hostname):
     # DNS-over-HTTPS - resolves via a normal HTTPS request (port 443) instead
@@ -475,6 +494,75 @@ def ghmc_connectivity_test():
         return jsonify({"ok": False, "reached_ghmc": False, "error": str(e)[:500]})
 
 
+def fetch_tenderdetail_page(url):
+    # tenderdetail.com is a normal, non-.gov.in domain - no reason to expect
+    # the same DNS quirk ghmc.gov.in hit, so a plain retry (no DoH fallback)
+    # is used here rather than dragging in that whole mechanism pre-emptively.
+    user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    last_error = None
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": user_agent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            })
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                return resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                time.sleep(2)
+    raise last_error
+
+
+def parse_tenderdetail_rows(html):
+    # Anchored on the one thing that's certain to be stable: tenderdetail.com's
+    # detail-page URL pattern /Indian-Tenders/TenderNotice/{id}/{hash}. Title,
+    # deadline, value, and doc-availability are pulled from the text between
+    # one such link and the next, via looser sub-patterns so small markup
+    # changes don't break the whole parse.
+    rows = []
+    link_pattern = re.compile(
+        r'href="(/Indian-Tenders/TenderNotice/(\d+)/([a-f0-9]+))"[^>]*>(.*?)</a>', re.S | re.I
+    )
+    matches = list(link_pattern.finditer(html))
+    for i, m in enumerate(matches):
+        detail_path, tender_id, tender_hash, link_text = m.groups()
+        title = re.sub(r'<[^>]+>', '', link_text).strip()
+        title = re.sub(r'\s+', ' ', title)
+        if not title or len(title) < 8:
+            continue
+        window_end = matches[i + 1].start() if i + 1 < len(matches) else min(len(html), m.end() + 1500)
+        block = html[m.end():window_end]
+        block_text = re.sub(r'<[^>]+>', ' ', block)
+        block_text = re.sub(r'\s+', ' ', block_text)
+
+        deadline_match = re.search(r'Closes\s+([A-Za-z]+ \d{1,2},\s*\d{4})', block_text)
+        deadline = deadline_match.group(1) if deadline_match else None
+        value_match = re.search(r'₹\s*([\d,\.]+\s*(?:Crore|Lakh|Lac)?|Ref\.?\s*Document)', block_text, re.I)
+        value = value_match.group(1).strip() if value_match else None
+        has_real_doc = bool(re.search(r'Tender Document', block_text, re.I))
+        scanned_only = bool(re.search(r'Scan Images', block_text, re.I))
+
+        rows.append({
+            "id": tender_id,
+            "title": title,
+            "deadline": deadline,
+            "value": value,
+            "has_tender_document": has_real_doc,
+            "scanned_images_only": scanned_only,
+            "detail_url": "https://www.tenderdetail.com" + detail_path,
+        })
+    seen_ids = set()
+    deduped = []
+    for r in rows:
+        if r["id"] in seen_ids:
+            continue
+        seen_ids.add(r["id"])
+        deduped.append(r)
+    return deduped
+
+
 @app.route('/api/ghmc-fetch-doc-test', methods=['GET'])
 def ghmc_fetch_doc_test():
     # Lets a specific document URL be tested directly (e.g. one shown by
@@ -495,16 +583,41 @@ def ghmc_fetch_doc_test():
 
 @app.route('/api/ghmc-tenders-list', methods=['GET'])
 def ghmc_tenders_list():
-    # Public - GHMC's own tender listing is public data, this just returns
-    # what's currently on their page in a clean JSON shape (work name + PDF
-    # link) so any tender - not just Patancheru-matching ones - can be
-    # manually browsed/downloaded and fed into Tender Scrutiny by hand.
-    try:
-        html = fetch_ghmc_tenders_page()
-        rows = parse_ghmc_tender_rows(html)
-        return jsonify({"ok": True, "tenders": rows})
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Could not fetch/parse GHMC tenders page: {str(e)[:300]}"}), 500
+    # Public - GHMC's own tender listing has no Patancheru-area data at all
+    # (see comment on TENDERDETAIL_GHMC_PAGES above), so this pulls from
+    # tenderdetail.com's GHMC-authority listing across all 3 pages instead.
+    # Returns the FULL scanned list (not pre-filtered) with an
+    # is_patancheru_area flag per row, so the frontend can filter by area
+    # and/or a free-text keyword (e.g. "school", "hospital") independently.
+    all_rows = []
+    fetch_errors = []
+    debug_sample = None
+    debug_html_len = None
+    for page_url in TENDERDETAIL_GHMC_PAGES:
+        try:
+            html = fetch_tenderdetail_page(page_url)
+            page_rows = parse_tenderdetail_rows(html)
+            all_rows.extend(page_rows)
+            if debug_sample is None:
+                debug_html_len = len(html)
+                debug_sample = html[:800]
+        except Exception as e:
+            fetch_errors.append(str(e)[:200])
+
+    if not all_rows and fetch_errors:
+        return jsonify({"ok": False, "error": f"Could not fetch tender listing: {'; '.join(fetch_errors)}"}), 500
+
+    for r in all_rows:
+        r["is_patancheru_area"] = any(k in r["title"].lower() for k in PATANCHERU_AREA_KEYWORDS)
+
+    return jsonify({
+        "ok": True,
+        "tenders": all_rows,
+        "total_scanned": len(all_rows),
+        "partial_fetch_errors": fetch_errors or None,
+        "debug_html_len": debug_html_len if not all_rows else None,
+        "debug_sample": debug_sample if not all_rows else None,
+    })
 
 
 @app.route('/api/ghmc-tender-watch', methods=['GET'])
@@ -517,10 +630,18 @@ def ghmc_tender_watch():
         return jsonify({"ok": False, "error": "Server misconfiguration."}), 500
 
     try:
-        html = fetch_ghmc_tenders_page()
-        rows = parse_ghmc_tender_rows(html)
+        all_rows = []
+        fetch_errors = []
+        for page_url in TENDERDETAIL_GHMC_PAGES:
+            try:
+                html = fetch_tenderdetail_page(page_url)
+                all_rows.extend(parse_tenderdetail_rows(html))
+            except Exception as e:
+                fetch_errors.append(str(e)[:200])
+        if not all_rows and fetch_errors:
+            return jsonify({"ok": False, "error": f"Could not fetch tender listing: {'; '.join(fetch_errors)}"}), 500
     except Exception as e:
-        return jsonify({"ok": False, "error": f"Could not fetch/parse GHMC tenders page: {str(e)[:300]}"}), 500
+        return jsonify({"ok": False, "error": f"Could not fetch/parse tender listing: {str(e)[:300]}"}), 500
 
     try:
         seen_data, seen_sha = github_get(GHMC_SEEN_TENDERS_FILE, site_token, timeout=8)
@@ -529,79 +650,56 @@ def ghmc_tender_watch():
     first_run = seen_data is None
     seen_ids = set((seen_data or {}).get("seen_ids", []))
 
+    rows = all_rows
     new_rows = [r for r in rows if r["id"] not in seen_ids]
 
-    # Scoped to Patancheru only for now, per explicit request - GHMC tender
-    # titles include the locality name inline (e.g. "...in Madinaguda, Ward
-    # No.237, Miyapur Division-48..."), so a straightforward keyword match
-    # on the work name is enough - no separate circle/zone lookup needed.
-    # Everything on the page still gets marked "seen" below regardless of
-    # this filter, so non-Patancheru tenders are correctly never re-checked,
-    # they're just never analyzed or alerted on.
-    AREA_KEYWORDS = ("patancheru", "pattancheru")
-    relevant_new_rows = [r for r in new_rows if any(k in r["work_name"].lower() for k in AREA_KEYWORDS)]
+    # Place-name keywords, not "GHMC" as an authority - see comment on
+    # PATANCHERU_AREA_KEYWORDS above. Everything on the page still gets
+    # marked "seen" below regardless of this filter, so non-matching
+    # tenders are correctly never re-checked, just never alerted on.
+    relevant_new_rows = [r for r in new_rows if any(k in r["title"].lower() for k in PATANCHERU_AREA_KEYWORDS)]
 
-    analyzed = []
+    alerted = []
 
-    # Cap how many we actually run the AI on per call, in case the page ever
-    # returns a big batch (e.g. first run, or GHMC posts many at once) - the
-    # rest will simply be picked up as "new" on the next scheduled run since
-    # they stay unseen, rather than burning a huge amount of Gemini credit
-    # in one go. We're a startup - controlled, not unlimited, AI spend.
-    MAX_PER_RUN = 5
+    # No free PDF is available from this source (tenderdetail.com lead-gates
+    # the actual document behind a name/phone/OTP form) - so this can no
+    # longer auto-run the clause-level anomaly analysis the way it did
+    # against ghmc.gov.in's now-abandoned listing. It still alerts on every
+    # new matching tender with full metadata + a direct link, so nothing
+    # slips by unnoticed; full Scrutiny stays a manual next step until/unless
+    # a paid data source with real document access is set up.
+    MAX_PER_RUN = 10
 
-    if not first_run:
+    if not first_run and bot_token and chat_id_config:
         for row in relevant_new_rows[:MAX_PER_RUN]:
-            if not row["doc_url"]:
-                continue  # nothing to actually analyze without a document
+            doc_note = "📄 Document available" if row["has_tender_document"] else ("🖼️ Scanned images only" if row["scanned_images_only"] else "⚠️ No document listed")
+            msg = (
+                f"📋 <b>New Patancheru-area tender</b>\n"
+                f"{row['title'][:250]}\n"
+                f"Deadline: {row['deadline'] or 'not listed'} · Value: {row['value'] or 'Ref. Document'}\n"
+                f"{doc_note}\n"
+                f"View & download: {row['detail_url']}"
+            )
             try:
-                pdf_bytes = fetch_ghmc_url_hardened(row["doc_url"])
-                if not pdf_bytes.startswith(b"%PDF"):
-                    continue  # link wasn't actually a PDF (e.g. a detail page instead)
-                result = run_tender_anomaly_analysis(pdf_bytes, gemini_key)
-                if not result:
-                    continue
-                entry_id = log_tender_scrutiny_result(site_token, row["work_name"], result, source="ghmc-auto")
-                analyzed.append({"work_name": row["work_name"], "entry_id": entry_id, "flags": len(result.get("flags", [])) + len(result.get("relaxation_clauses", []))})
-
-                if bot_token and chat_id_config:
-                    high_severity = [f for f in result.get("flags", []) if f.get("severity") == "High"]
-                    relaxation_count = len(result.get("relaxation_clauses", []))
-                    # Notify on EVERY analyzed Patancheru tender, not just
-                    # flagged ones - the point of watching a specific area is
-                    # to know about all of it, not only the concerning ones.
-                    # Severity of the emoji/framing still signals at a glance
-                    # whether it's worth opening immediately or just FYI.
-                    if high_severity or relaxation_count:
-                        headline = "🚩 <b>New Patancheru tender — issues flagged</b>"
-                    else:
-                        headline = "📄 <b>New Patancheru tender</b>"
-                    msg = (
-                        f"{headline}\n"
-                        f"{row['work_name'][:200]}\n"
-                        f"High-severity flags: {len(high_severity)} · Relaxation clauses: {relaxation_count}\n"
-                        f"Full analysis: /admin/tender-scrutiny.html (see history)\n"
-                        f"Document: {row['doc_url']}"
-                    )
-                    send_telegram_to_all(bot_token, chat_id_config, msg[:4000])
+                send_telegram_to_all(bot_token, chat_id_config, msg[:4000])
+                alerted.append(row["title"][:200])
             except Exception:
-                continue  # one bad tender/PDF shouldn't stop the rest of the run
+                continue
 
-    # Mark everything we saw this run (whether analyzed or not) so we don't
-    # re-process it, and don't blow past a reasonable stored history size.
     all_current_ids = [r["id"] for r in rows]
     merged = list(dict.fromkeys(all_current_ids + list(seen_ids)))[:1000]
     try:
-        github_put(GHMC_SEEN_TENDERS_FILE, site_token, {"seen_ids": merged}, seen_sha, "Update seen GHMC tender ids", timeout=10)
+        github_put(GHMC_SEEN_TENDERS_FILE, site_token, {"seen_ids": merged}, seen_sha, "Update seen tender ids", timeout=10)
     except Exception:
         pass
 
-    return jsonify({"ok": True, "total_on_page": len(rows), "new_found": len(new_rows), "new_matching_area": len(relevant_new_rows), "analyzed_this_run": len(analyzed), "first_run": first_run})
+    return jsonify({"ok": True, "total_scanned": len(rows), "new_found": len(new_rows), "new_matching_area": len(relevant_new_rows), "alerted_this_run": len(alerted), "first_run": first_run})
 
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "service": "lawsticker-ghmc-relay", "routes": [
         "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test",
+        "(note: ghmc-tenders-list and ghmc-tender-watch now source from tenderdetail.com, not ghmc.gov.in)",
     ]})
 
 
