@@ -556,11 +556,47 @@ def parse_tenderdetail_rows(html):
         has_real_doc = bool(re.search(r'Tender Document', block_text, re.I))
         scanned_only = bool(re.search(r'Scan Images', block_text, re.I))
 
+        # Extra fields grabbed from the same block, no additional fetch
+        # needed - all best-effort (None if not found), never required.
+        days_left_match = re.search(r'(\d+)\s*days?\s*left', block_text, re.I)
+        days_left = int(days_left_match.group(1)) if days_left_match else None
+        status = "Closed" if re.search(r'\bClosed\b', block_text, re.I) else ("Live" if re.search(r'\bLive\b', block_text, re.I) else None)
+        tender_mode = "Offline" if re.search(r'\bOffline\b', block_text, re.I) else ("Online" if re.search(r'\bOnline\b', block_text, re.I) else None)
+        # Category sits right before "Local Bodies"/similar department tags
+        # on tenderdetail.com listings - captured loosely since exact
+        # category taxonomy isn't something to over-fit a regex to.
+        category_match = re.search(r'([A-Za-z][A-Za-z &]{3,40})\s*Local Bodies', block_text)
+        category = category_match.group(1).strip() if category_match else None
+
+        # A server-computed numeric value (in rupees) so the frontend can
+        # sort/filter without re-parsing "7.14 Lakh"/"2.74 Crore" strings
+        # itself - one parser, one place, used consistently everywhere.
+        value_rupees = None
+        if value:
+            num_match = re.match(r'([\d,\.]+)', value)
+            if num_match:
+                try:
+                    num = float(num_match.group(1).replace(',', ''))
+                    unit = value.lower()
+                    if 'crore' in unit:
+                        value_rupees = num * 1e7
+                    elif 'lakh' in unit or 'lac' in unit:
+                        value_rupees = num * 1e5
+                    else:
+                        value_rupees = num
+                except ValueError:
+                    value_rupees = None
+
         rows.append({
             "id": tender_id,
             "title": title,
             "deadline": deadline,
             "value": value,
+            "value_rupees": value_rupees,
+            "days_left": days_left,
+            "status": status,
+            "tender_mode": tender_mode,
+            "category": category,
             "has_tender_document": has_real_doc,
             "scanned_images_only": scanned_only,
             "detail_url": "https://www.tenderdetail.com" + detail_path,
