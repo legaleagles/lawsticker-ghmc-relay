@@ -563,6 +563,72 @@ def parse_tenderdetail_rows(html):
     return deduped
 
 
+def parse_tenderdetail_detail_page(html):
+    # Extracts the richer fields visible on a single tender's detail page
+    # (not the PDF - these are shown on the page itself, ungated). Labels
+    # and values sit close together in the markup; matched loosely (any
+    # tags between label and value) so small structural changes don't break
+    # the whole parse. Returns None per field it can't find rather than
+    # failing the whole extraction - partial detail is still useful.
+    def find_value(label_pattern, text, max_gap=200):
+        m = re.search(label_pattern + r'.{0,' + str(max_gap) + r'}?</[^>]+>\s*<[^>]+>\s*([^<]{1,120})', text, re.S | re.I)
+        return m.group(1).strip() if m else None
+
+    text = html
+    result = {}
+    result["tender_no"] = find_value(r'Tender\s*No\b', text)
+    result["publish_date"] = find_value(r'Publish\s*Date\b', text)
+    result["submission_date"] = find_value(r'Submission\s*Date\b', text)
+    result["tender_value"] = find_value(r'Tender\s*Value\b', text)
+    result["tender_fee"] = find_value(r'Tender\s*Fee\b', text)
+    result["emd"] = find_value(r'\bEMD\b(?!\s*Exemption)', text)
+    result["emd_exemption"] = find_value(r'EMD\s*Exemption\b|Exemption\b', text)
+    result["competition_type"] = find_value(r'Competition\s*Type\b', text)
+    result["bidding_type"] = find_value(r'Bidding\s*Type\b', text)
+    result["city"] = find_value(r'\bCity\b', text)
+    result["state"] = find_value(r'\bState\b', text)
+    result["authority_name"] = find_value(r'Authority\s*Name\b', text)
+
+    # Corrigendum table - each row is a date + optional new-submission-date;
+    # frequency/recency of corrigendums is itself a useful signal (repeated
+    # amendments can indicate spec or eligibility problems in the original
+    # tender), even without reading the PDF.
+    corrigendum_dates = re.findall(r'(\d{1,2}-[A-Za-z]{3}-\d{4})', text)
+    result["corrigendum_count"] = max(0, len(set(corrigendum_dates)) - 1)  # rough - first date pair is usually publish, not a corrigendum
+    result["has_corrigendum"] = bool(re.search(r'Corrigendum-1|Corrigendum\s*Issued', text, re.I))
+
+    found_count = sum(1 for v in result.values() if v not in (None, False, 0))
+    return result, found_count
+
+
+@app.route('/api/ghmc-tender-detail', methods=['GET'])
+def ghmc_tender_detail():
+    # Fetches the richer, still-free fields on a single tender's OWN detail
+    # page (tender number, EMD, dates, competition type, corrigendum
+    # history) - not the gated PDF, just what tenderdetail.com shows on the
+    # page itself. Called per-tender from the frontend (on demand), not
+    # bulk, to avoid hammering their site with 105 extra fetches per list
+    # refresh.
+    from flask import request
+    detail_url = request.args.get("url", "")
+    if not detail_url.startswith("https://www.tenderdetail.com/Indian-Tenders/TenderNotice/"):
+        return jsonify({"ok": False, "error": "url must be a tenderdetail.com TenderNotice link"}), 400
+    try:
+        html = fetch_tenderdetail_page(detail_url)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Could not fetch detail page: {str(e)[:300]}"}), 502
+
+    detail, found_count = parse_tenderdetail_detail_page(html)
+    response = {"ok": True, "detail": detail}
+    if found_count < 3:
+        # Parser found almost nothing - same diagnostic pattern as the list
+        # endpoint, since this parser was also written without being able
+        # to see this domain's raw HTML from this sandbox's own network.
+        response["debug_html_len"] = len(html)
+        response["debug_sample"] = html[:1200]
+    return jsonify(response)
+
+
 @app.route('/api/ghmc-fetch-doc-test', methods=['GET'])
 def ghmc_fetch_doc_test():
     # Lets a specific document URL be tested directly (e.g. one shown by
@@ -698,7 +764,7 @@ def ghmc_tender_watch():
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "service": "lawsticker-ghmc-relay", "routes": [
-        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test",
+        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail",
         "(note: ghmc-tenders-list and ghmc-tender-watch now source from tenderdetail.com, not ghmc.gov.in)",
     ]})
 
