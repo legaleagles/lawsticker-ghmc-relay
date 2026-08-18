@@ -597,7 +597,7 @@ def parse_tenderdetail_detail_page(html):
     result["corrigendum_count"] = max(0, len(set(corrigendum_dates)) - 1)  # rough - first date pair is usually publish, not a corrigendum
     result["has_corrigendum"] = bool(re.search(r'Corrigendum-1|Corrigendum\s*Issued', text, re.I))
 
-    found_count = sum(1 for v in result.values() if v not in (None, False, 0))
+    found_count = sum(1 for v in result.values() if v)
     return result, found_count
 
 
