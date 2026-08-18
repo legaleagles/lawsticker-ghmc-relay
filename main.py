@@ -641,8 +641,67 @@ def parse_tenderdetail_detail_page(html):
     return result, found_count
 
 
-@app.route('/api/ghmc-tender-detail', methods=['GET'])
-def ghmc_tender_detail():
+GHMC_METADATA_REVIEW_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "assessment": {"type": "STRING", "description": "2-4 sentence plain-language assessment of what the metadata suggests, calibrated to what is actually knowable without the document itself"},
+        "flags": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "severity": {"type": "STRING", "enum": ["Low", "Medium", "High"]},
+                    "point": {"type": "STRING", "description": "one specific observation, under 200 characters"},
+                },
+                "required": ["severity", "point"],
+            },
+        },
+        "what_the_document_would_show": {"type": "STRING", "description": "1-2 sentences on what real clause-level scrutiny would need the PDF to check, that metadata alone cannot"},
+    },
+    "required": ["assessment", "flags", "what_the_document_would_show"],
+}
+
+
+@app.route('/api/ghmc-tender-metadata-review', methods=['POST'])
+def ghmc_tender_metadata_review():
+    # A genuinely separate, lighter thing from full PDF-based Tender
+    # Scrutiny: this sends ONLY the already-fetched metadata (title, value,
+    # EMD, dates, competition type, etc - no document text, since none is
+    # available from this source) to Gemini for a plausibility read. The
+    # prompt is explicit about this limitation so the model doesn't invent
+    # clause-level findings it has no basis for.
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        return jsonify({"ok": False, "error": "Server misconfiguration - missing GEMINI_API_KEY."}), 500
+
+    from flask import request
+    body = request.get_json(force=True, silent=True) or {}
+    title = (body.get("title") or "").strip()
+    detail = body.get("detail") or {}
+    if not title:
+        return jsonify({"ok": False, "error": "title is required."}), 400
+
+    detail_lines = "\n".join(f"- {k}: {v}" for k, v in detail.items() if v)
+    prompt = f"""You are reviewing METADATA ONLY for an Indian government tender - not the actual tender document/PDF, which is not available to you. Do not invent or assume clause-level details (eligibility criteria, discretionary powers, financial structure) that can only exist in the real document - if asked about those, say plainly that the document itself would need to be reviewed.
+
+Based ONLY on what's below, give a calibrated plausibility assessment: does anything about the published metadata itself look unusual (competition type, EMD, timeline, recall/re-tender status, submission mode)? Be honest and specific - if nothing stands out, say so rather than manufacturing a concern.
+
+Tender title: {title}
+
+Metadata:
+{detail_lines}
+
+Respond with the assessment, a list of specific flags (each with severity), and a short note on what the actual document would be needed to check."""
+
+    try:
+        result = call_gemini_structured(gemini_key, prompt, GHMC_METADATA_REVIEW_SCHEMA, max_tokens=500, timeout=20)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Gemini review failed: {str(e)[:300]}"}), 502
+
+    return jsonify({"ok": True, "review": result})
+
+
+
     # Fetches the richer, still-free fields on a single tender's OWN detail
     # page (tender number, EMD, dates, competition type, corrigendum
     # history) - not the gated PDF, just what tenderdetail.com shows on the
@@ -830,7 +889,7 @@ def ghmc_tender_watch():
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "service": "lawsticker-ghmc-relay", "routes": [
-        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail",
+        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail", "/api/ghmc-tender-metadata-review",
         "(note: ghmc-tenders-list and ghmc-tender-watch now source from tenderdetail.com, not ghmc.gov.in)",
     ]})
 
