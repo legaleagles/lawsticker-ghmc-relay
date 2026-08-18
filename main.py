@@ -701,7 +701,8 @@ Respond with the assessment, a list of specific flags (each with severity), and 
     return jsonify({"ok": True, "review": result})
 
 
-
+@app.route('/api/ghmc-tender-detail', methods=['GET'])
+def ghmc_tender_detail():
     # Fetches the richer, still-free fields on a single tender's OWN detail
     # page (tender number, EMD, dates, competition type, corrigendum
     # history) - not the gated PDF, just what tenderdetail.com shows on the
