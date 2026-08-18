@@ -40,6 +40,18 @@ CORS(app)  # the site (lawsticker-ai.com) calls this cross-origin from the
            # browser, so CORS headers are required or the browser blocks
            # the response client-side even though the server itself works fine
 
+
+@app.errorhandler(Exception)
+def handle_any_uncaught_error(e):
+    # Without this, an uncaught exception anywhere returns Flask's default
+    # HTML error page, which has no CORS headers - the browser then reports
+    # a generic "Network error"/"Failed to fetch" instead of a readable
+    # error, making a real 500 look like a connectivity problem. This
+    # guarantees every response, even from a bug nobody's caught yet, is
+    # valid CORS-safe JSON the frontend can actually display.
+    import traceback
+    return jsonify({"ok": False, "error": f"Unhandled server error: {str(e)[:300]}", "trace_tail": traceback.format_exc()[-500:]}), 500
+
 REPO = "legaleagles/LabourLaw2"
 GITHUB_API = "https://api.github.com"
 GEMINI_MODEL = "gemini-flash-lite-latest"
@@ -618,7 +630,23 @@ def ghmc_tender_detail():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Could not fetch detail page: {str(e)[:300]}"}), 502
 
-    detail, found_count = parse_tenderdetail_detail_page(html)
+    try:
+        detail, found_count = parse_tenderdetail_detail_page(html)
+    except Exception as e:
+        # Parsing must never 500 the whole request - an uncaught exception
+        # here previously produced Flask's raw error page (no CORS headers),
+        # which browsers report as an opaque "Network error" rather than a
+        # readable error, making it look like a connectivity problem instead
+        # of what it actually was. Always return valid JSON with a sample of
+        # the real page instead, so a parser bug is diagnosable, not silent.
+        return jsonify({
+            "ok": True,
+            "detail": {},
+            "parse_error": str(e)[:300],
+            "debug_html_len": len(html),
+            "debug_sample": html[:1200],
+        })
+
     response = {"ok": True, "detail": detail}
     if found_count < 3:
         # Parser found almost nothing - same diagnostic pattern as the list
