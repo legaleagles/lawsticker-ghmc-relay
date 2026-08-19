@@ -1307,10 +1307,41 @@ Respond with the assessment, a list of specific flags (each with severity), a sh
     })
 
 
+@app.route('/api/ghmc-telegram-test', methods=['GET'])
+def ghmc_telegram_test():
+    # Isolated diagnostic - sends a tiny real PDF to Telegram directly,
+    # independent of the actual pipeline finding a genuinely flagged
+    # tender to test against. Answers "does delivery even work" on its
+    # own, since that could otherwise stay unverified for a long time if
+    # few real Patancheru-area tenders happen to get flagged.
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id_config = os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id_config:
+        return jsonify({
+            "ok": False,
+            "error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set on this service.",
+            "bot_token_present": bool(bot_token),
+            "chat_id_present": bool(chat_id_config),
+        }), 500
+
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 10, "Telegram delivery test - lawsticker-ghmc-relay", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(0, 6, f"If you can see this, PDF+Telegram delivery works correctly. Generated {datetime.now(timezone.utc).isoformat()}.")
+    pdf_bytes = bytes(pdf.output())
+
+    results = send_telegram_document_to_all(bot_token, chat_id_config, pdf_bytes, "telegram_test.pdf", "🧪 Test message from the GHMC tender auto-pipeline diagnostic endpoint.")
+    any_sent = any(v == "sent" for v in results.values())
+    return jsonify({"ok": any_sent, "chat_results": results})
+
+
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "service": "lawsticker-ghmc-relay", "routes": [
-        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail", "/api/ghmc-tender-metadata-review", "/api/ghmc-tender-auto-pipeline",
+        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail", "/api/ghmc-tender-metadata-review", "/api/ghmc-tender-auto-pipeline", "/api/ghmc-telegram-test",
         "(note: ghmc-tenders-list and ghmc-tender-watch now source from tenderdetail.com, not ghmc.gov.in)",
     ]})
 
