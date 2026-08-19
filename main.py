@@ -1269,10 +1269,24 @@ Respond with the assessment, a list of specific flags (each with severity), a sh
                     f"{row.get('detail_url', '')}"
                 )
                 filename = f"tender_{row['id']}_report.pdf"
-                send_telegram_document_to_all(bot_token, chat_id_config, pdf_bytes, filename, caption)
-                alerted.append(row["id"])
+                # send_telegram_document_to_all catches per-chat exceptions
+                # internally (so one failing chat doesn't stop others) and
+                # returns a results dict rather than raising - the caller
+                # MUST inspect that dict, since a bare call here would
+                # silently report success even when every single chat send
+                # actually failed (this was a real bug: "telegram_alerts_sent"
+                # was previously incremented unconditionally regardless of
+                # whether delivery genuinely succeeded).
+                send_results = send_telegram_document_to_all(bot_token, chat_id_config, pdf_bytes, filename, caption)
+                any_sent = any(v == "sent" for v in send_results.values())
+                if any_sent:
+                    alerted.append(row["id"])
+                else:
+                    errors.append({"id": row["id"], "stage": "telegram_send", "error": str(send_results)[:300]})
             except Exception as e:
                 errors.append({"id": row["id"], "stage": "pdf_or_telegram", "error": str(e)[:300]})
+        elif is_questionable and not (bot_token and chat_id_config):
+            errors.append({"id": row["id"], "stage": "telegram_config", "error": "Tender was flagged but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID is not configured on this service - no alert could be sent."})
 
     try:
         github_put(GHMC_TENDER_ARCHIVE_FILE, site_token, archive, archive_sha, f"Archive {len(processed)} new area tenders", timeout=15)
