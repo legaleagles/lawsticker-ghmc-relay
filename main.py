@@ -1288,10 +1288,15 @@ Respond with the assessment, a list of specific flags (each with severity), a sh
         elif is_questionable and not (bot_token and chat_id_config):
             errors.append({"id": row["id"], "stage": "telegram_config", "error": "Tender was flagged but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID is not configured on this service - no alert could be sent."})
 
-    try:
-        github_put(GHMC_TENDER_ARCHIVE_FILE, site_token, archive, archive_sha, f"Archive {len(processed)} new area tenders", timeout=15)
-    except Exception as e:
-        errors.append({"stage": "archive_save", "error": str(e)[:300]})
+    # Only commit when something actually changed - at a 15-minute polling
+    # interval, writing to GitHub on every run (even when nothing new was
+    # found) would create ~96 no-op commits/day. Skipping this write also
+    # skips the GitHub API call entirely on quiet runs, not just the commit.
+    if processed:
+        try:
+            github_put(GHMC_TENDER_ARCHIVE_FILE, site_token, archive, archive_sha, f"Archive {len(processed)} new area tenders", timeout=15)
+        except Exception as e:
+            errors.append({"stage": "archive_save", "error": str(e)[:300]})
 
     return jsonify({
         "ok": True,
