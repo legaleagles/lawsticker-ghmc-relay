@@ -108,6 +108,39 @@ def send_telegram_to_all(bot_token, chat_id_config, text):
     return results
 
 
+def send_telegram_document(bot_token, chat_id, pdf_bytes, filename, caption):
+    # Telegram's sendDocument needs a real multipart/form-data body - this
+    # repo uses urllib (not requests) elsewhere, so the multipart encoding
+    # is built by hand here rather than pulling in a new dependency just
+    # for one endpoint.
+    url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+    boundary = "----lawstickerBoundary" + hashlib.md5(filename.encode()).hexdigest()[:12]
+    parts = []
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}\r\n")
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:1024]}\r\n")
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"parse_mode\"\r\n\r\nHTML\r\n")
+    parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\nContent-Type: application/pdf\r\n\r\n")
+    body = "".join(parts).encode("utf-8") + bytes(pdf_bytes) + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.status
+
+
+def send_telegram_document_to_all(bot_token, chat_id_config, pdf_bytes, filename, caption):
+    results = {}
+    for cid in [c.strip() for c in chat_id_config.split(",") if c.strip()]:
+        try:
+            send_telegram_document(bot_token, cid, pdf_bytes, filename, caption)
+            results[cid] = "sent"
+        except Exception as e:
+            results[cid] = f"failed: {e}"
+    return results
+
+
 def call_gemini_structured(api_key, prompt, schema, max_tokens=600, timeout=15):
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -287,6 +320,14 @@ def log_tender_scrutiny_result(site_token, tender_name, result, source="manual")
 
 GHMC_TENDERS_PAGE = "https://www.ghmc.gov.in/Tenderspage.aspx"
 GHMC_SEEN_TENDERS_FILE = "ghmc-seen-tenders.json"
+# Permanent, growing archive - unlike GHMC_SEEN_TENDERS_FILE (which is just
+# a dedup marker), this stores full tender records (metadata + detail + AI
+# review) forever, even after a tender drops off the live listing. Since
+# there's no free historical archive to backfill from, this is how real
+# history actually accumulates - going forward, one hourly run at a time,
+# never discarding what's already been captured.
+GHMC_TENDER_ARCHIVE_FILE = "ghmc-tender-archive.json"
+GHMC_AUTO_PIPELINE_MAX_PER_RUN = 5  # Gemini + PDF + Telegram cost control per run
 
 # ghmc.gov.in's own listing carries no Patancheru-area data at all (confirmed
 # via testing - it's a small unrelated "General quotations" table). Real
@@ -305,6 +346,8 @@ PATANCHERU_AREA_KEYWORDS = (
     "rc puram", "r.c.puram", "beeramguda", "bollaram", "bollarum", "tellapur",
     "muthangi", "circle-45", "circle-46", "circle-47", "circle 45", "circle 46",
     "circle 47", "circle-49", "circle 49", "slpz", "serilingampally",
+    "sultanpur", "indresham", "isnapur", "pati village", "kistareddypet",
+    "nallavelly", "jp colony patancheru",
 )
 
 
@@ -611,6 +654,164 @@ def parse_tenderdetail_rows(html):
     return deduped
 
 
+def compute_quick_flags(title, detail):
+    # Server-side Python port of the same deterministic checks already
+    # shown client-side on the admin page (EMD ratio, bid window, recall
+    # detection, corrigendum, offline submission) - needed here since this
+    # runs unattended in the cron pipeline, not in a browser. Kept in sync
+    # in spirit with the JS version; any threshold change should be mirrored
+    # on both sides if it matters, though these are independent copies.
+    flags = []
+
+    def to_rupees(s):
+        if not s:
+            return None
+        m = re.match(r"([\d,\.]+)\s*(Crore|Lakh|Lakhs|Lac)?", s, re.I)
+        if not m:
+            return None
+        try:
+            num = float(m.group(1).replace(",", ""))
+        except ValueError:
+            return None
+        unit = (m.group(2) or "").lower()
+        if unit.startswith("crore"):
+            return num * 1e7
+        if unit.startswith("lakh") or unit.startswith("lac"):
+            return num * 1e5
+        return num
+
+    value_rs = to_rupees(detail.get("tender_value"))
+    emd_rs = to_rupees(detail.get("emd"))
+    if value_rs and emd_rs:
+        pct = (emd_rs / value_rs) * 100
+        if pct < 0.5:
+            flags.append({"level": "info", "text": f"EMD is unusually low ({pct:.2f}% of tender value)."})
+        elif pct > 5:
+            flags.append({"level": "info", "text": f"EMD is on the higher side ({pct:.2f}% of tender value)."})
+        else:
+            flags.append({"level": "ok", "text": f"EMD is {pct:.2f}% of tender value - within the typical 1-5% range."})
+
+    def parse_date(s):
+        if not s:
+            return None
+        for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s.strip(), fmt)
+            except Exception:
+                continue
+        return None
+
+    pub = parse_date(detail.get("publish_date"))
+    sub = parse_date(detail.get("submission_date"))
+    if pub and sub:
+        days = (sub - pub).days
+        if days <= 3:
+            flags.append({"level": "warn", "text": f"Very short bid window - only {days} day(s) between publish and submission."})
+        elif days <= 7:
+            flags.append({"level": "info", "text": f"Short bid window - {days} days between publish and submission."})
+        else:
+            flags.append({"level": "ok", "text": f"Bid window is {days} days - a reasonable amount of time to prepare a bid."})
+
+    if re.search(r"\d+\s*(?:st|nd|rd|th)?\s*recall|re-?call", title, re.I):
+        m = re.search(r"\d+\s*(?:st|nd|rd|th)?\s*recall", title, re.I)
+        label = m.group(0) if m else "recall"
+        flags.append({"level": "warn", "text": f"This is a re-issued tender ({label}) - worth checking why the earlier round didn't result in an award."})
+
+    if detail.get("has_corrigendum"):
+        flags.append({"level": "info", "text": "This tender has at least one corrigendum (amendment after original publication)."})
+
+    tender_type = (detail.get("tender_type") or "").lower()
+    if "offline" in tender_type:
+        flags.append({"level": "warn", "text": "This tender uses offline bid submission rather than the standard online e-procurement portal."})
+
+    return flags
+
+
+def generate_tender_pdf_report(row, detail, quick_flags, ai_review):
+    # Server-side PDF generation (fpdf2 - pure Python, no system deps, safe
+    # for Cloud Run without Docker changes) since this runs unattended in
+    # the cron pipeline, not in a browser where jsPDF could be used instead.
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(124, 90, 11)
+    pdf.multi_cell(0, 9, "Tender Scrutiny Alert Report", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 6, f"Generated {datetime.now(timezone.utc).strftime('%d %b %Y, %H:%M UTC')} - automated pipeline, lawsticker-ai.com", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    pdf.set_text_color(20, 20, 20)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.multi_cell(0, 7, row.get("title", "Untitled Tender"), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    def section_header(text):
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(124, 90, 11)
+        pdf.cell(0, 8, text, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(20, 20, 20)
+        pdf.set_font("Helvetica", "", 10)
+
+    section_header("Tender Details")
+    detail_rows = [
+        ("Tender No", detail.get("tender_no")), ("Tender ID", row.get("id")),
+        ("Authority", detail.get("authority_name")), ("Publish Date", detail.get("publish_date")),
+        ("Submission Date", detail.get("submission_date")), ("Tender Value", detail.get("tender_value") or row.get("value")),
+        ("EMD", detail.get("emd")), ("Competition Type", detail.get("competition_type")),
+        ("Tender Type", detail.get("tender_type")), ("Location", ", ".join(filter(None, [detail.get("city"), detail.get("state")]))),
+        ("Source Page", row.get("detail_url")),
+    ]
+    for label, val in detail_rows:
+        if not val:
+            continue
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(45, 6, label + ":")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 6, str(val), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    if quick_flags:
+        section_header("Quick Flags (computed from listed data)")
+        for f in quick_flags:
+            icon = "[!]" if f["level"] == "warn" else ("[OK]" if f["level"] == "ok" else "[i]")
+            pdf.multi_cell(0, 6, f"{icon} {f['text']}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    section_header("AI Assessment (metadata only - PDF not reviewed)")
+    pdf.multi_cell(0, 6, ai_review.get("assessment", ""), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    if ai_review.get("flags"):
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, "Flags:", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        for f in ai_review["flags"]:
+            pdf.multi_cell(0, 6, f"[{f.get('severity','')}] {f.get('point','')}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
+    if ai_review.get("what_the_document_would_show"):
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.set_text_color(90, 90, 90)
+        pdf.multi_cell(0, 6, "What the real document would still need to confirm: " + ai_review["what_the_document_would_show"], new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(20, 20, 20)
+        pdf.ln(3)
+
+    if ai_review.get("rti_points"):
+        section_header("Suggested RTI Questions (RTI Act, 2005)")
+        for i, q in enumerate(ai_review["rti_points"], 1):
+            pdf.multi_cell(0, 6, f"{i}. {q}", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(3)
+
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(0, 5, "Compiled automatically from public tender-listing metadata. No tender document (PDF) was reviewed for this report - this is a plausibility summary from listed fields only, not a clause-level fairness audit. Verify all details against the original source before taking any action, including before filing any RTI request.", new_x="LMARGIN", new_y="NEXT")
+
+    return bytes(pdf.output())
+
+
 def parse_tenderdetail_detail_page(html):
     # Extracts the richer fields visible on a single tender's detail page
     # (not the PDF - these are shown on the page itself, ungated). Labels
@@ -693,8 +894,13 @@ GHMC_METADATA_REVIEW_SCHEMA = {
             },
         },
         "what_the_document_would_show": {"type": "STRING", "description": "1-2 sentences on what real clause-level scrutiny would need the PDF to check, that metadata alone cannot"},
+        "rti_points": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "description": "Only fill this in if there is at least one Medium or High severity flag - specific, concrete RTI (Right to Information Act 2005) questions a citizen could file with the tendering authority to get clarity on the flagged concern(s). Each should be phrased as an actual RTI question (e.g. 'Please provide the reasons recorded for cancelling/re-tendering NIT No. X, and copies of any file notings related to this decision'), not a vague request. Leave empty if there are no Medium/High flags - don't manufacture RTI points for a clean tender.",
+        },
     },
-    "required": ["assessment", "flags", "what_the_document_would_show"],
+    "required": ["assessment", "flags", "what_the_document_would_show", "rti_points"],
 }
 
 
@@ -727,7 +933,7 @@ Tender title: {title}
 Metadata:
 {detail_lines}
 
-Respond with the assessment, a list of specific flags (each with severity), and a short note on what the actual document would be needed to check."""
+Respond with the assessment, a list of specific flags (each with severity), a short note on what the actual document would be needed to check, and - only if at least one flag is Medium or High severity - specific RTI Act 2005 questions a citizen could file with the tendering authority about the flagged concern(s)."""
 
     try:
         result = call_gemini_structured(gemini_key, prompt, GHMC_METADATA_REVIEW_SCHEMA, max_tokens=500, timeout=20)
@@ -923,10 +1129,157 @@ def ghmc_tender_watch():
 
     return jsonify({"ok": True, "total_scanned": len(rows), "new_found": len(new_rows), "new_matching_area": len(relevant_new_rows), "alerted_this_run": len(alerted), "first_run": first_run})
 
+@app.route('/api/ghmc-tender-auto-pipeline', methods=['GET'])
+def ghmc_tender_auto_pipeline():
+    # The actual hourly job (triggered by cron-job.org). No historical
+    # backfill happens here - there's no free source to page through for
+    # past months (checked and confirmed absent). Instead, every run:
+    # 1. Checks the current live listing for area-matching tenders
+    # 2. Skips anything already in the permanent archive (so re-running
+    #    hourly just catches whatever's newly appeared since last time)
+    # 3. For genuinely new ones: fetches full detail, computes Quick Flags,
+    #    runs the AI metadata review (incl. RTI points when warranted)
+    # 4. Archives EVERY new tender permanently, flagged or not
+    # 5. Only sends a Telegram PDF alert for the ones with a real Medium/
+    #    High severity flag - not everything, so the channel doesn't
+    #    become noise
+    site_token = os.environ.get("SITE_REPO_TOKEN")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id_config = os.environ.get("TELEGRAM_CHAT_ID")
+
+    try:
+        all_rows = []
+        fetch_errors = []
+        for page_url in TENDERDETAIL_GHMC_PAGES:
+            try:
+                html = fetch_tenderdetail_page(page_url)
+                all_rows.extend(parse_tenderdetail_rows(html))
+            except Exception as e:
+                fetch_errors.append(str(e)[:200])
+        if not all_rows and fetch_errors:
+            return jsonify({"ok": False, "error": f"Could not fetch tender listing: {'; '.join(fetch_errors)}"}), 500
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Could not fetch/parse tender listing: {str(e)[:300]}"}), 500
+
+    area_rows = [r for r in all_rows if any(k in r["title"].lower() for k in PATANCHERU_AREA_KEYWORDS)]
+    # De-dupe by id across the pages fetched this run - each page should be
+    # distinct in normal operation, but this is cheap insurance against
+    # double-processing (and double Telegram-alerting) if any two page
+    # fetches ever overlap.
+    seen_this_run = set()
+    deduped_area_rows = []
+    for r in area_rows:
+        if r["id"] in seen_this_run:
+            continue
+        seen_this_run.add(r["id"])
+        deduped_area_rows.append(r)
+    area_rows = deduped_area_rows
+
+    try:
+        archive, archive_sha = github_get(GHMC_TENDER_ARCHIVE_FILE, site_token, timeout=10)
+    except Exception:
+        archive, archive_sha = None, None
+    if archive is None:
+        archive = {"tenders": {}}
+    archived_ids = set(archive.get("tenders", {}).keys())
+
+    new_rows = [r for r in area_rows if r["id"] not in archived_ids]
+    to_process = new_rows[:GHMC_AUTO_PIPELINE_MAX_PER_RUN]
+    # Anything beyond the cap this run simply isn't archived yet, so it's
+    # naturally picked up on the next hourly run - no separate cursor
+    # needed since "not yet in the archive" IS the queue.
+
+    processed = []
+    alerted = []
+    errors = []
+
+    for row in to_process:
+        try:
+            detail_html = fetch_tenderdetail_page(row["detail_url"])
+            detail, _ = parse_tenderdetail_detail_page(detail_html)
+        except Exception as e:
+            detail = {}
+            errors.append({"id": row["id"], "stage": "detail_fetch", "error": str(e)[:200]})
+
+        quick_flags = []
+        try:
+            quick_flags = compute_quick_flags(row["title"], detail)
+        except Exception as e:
+            errors.append({"id": row["id"], "stage": "quick_flags", "error": str(e)[:200]})
+
+        ai_review = None
+        if gemini_key:
+            try:
+                detail_lines = "\n".join(f"- {k}: {v}" for k, v in detail.items() if v)
+                prompt = f"""You are reviewing METADATA ONLY for an Indian government tender - not the actual tender document/PDF, which is not available to you. Do not invent or assume clause-level details (eligibility criteria, discretionary powers, financial structure) that can only exist in the real document - if asked about those, say plainly that the document itself would need to be reviewed.
+
+Based ONLY on what's below, give a calibrated plausibility assessment: does anything about the published metadata itself look unusual (competition type, EMD, timeline, recall/re-tender status, submission mode)? Be honest and specific - if nothing stands out, say so rather than manufacturing a concern.
+
+Tender title: {row['title']}
+
+Metadata:
+{detail_lines}
+
+Respond with the assessment, a list of specific flags (each with severity), a short note on what the actual document would be needed to check, and - only if at least one flag is Medium or High severity - specific RTI Act 2005 questions a citizen could file with the tendering authority about the flagged concern(s)."""
+                ai_review = call_gemini_structured(gemini_key, prompt, GHMC_METADATA_REVIEW_SCHEMA, max_tokens=800, timeout=25)
+            except Exception as e:
+                errors.append({"id": row["id"], "stage": "ai_review", "error": str(e)[:200]})
+        if not ai_review:
+            ai_review = {"assessment": "", "flags": [], "what_the_document_would_show": "", "rti_points": []}
+
+        is_questionable = any(f.get("severity") in ("Medium", "High") for f in ai_review.get("flags", [])) or \
+            any(f["level"] == "warn" for f in quick_flags)
+
+        record = {
+            "id": row["id"], "title": row["title"], "deadline": row.get("deadline"),
+            "value": row.get("value"), "detail_url": row.get("detail_url"),
+            "first_archived_at": datetime.now(timezone.utc).isoformat(),
+            "detail": detail, "quick_flags": quick_flags, "ai_review": ai_review,
+            "is_questionable": is_questionable,
+        }
+        archive["tenders"][row["id"]] = record
+        processed.append({"id": row["id"], "title": row["title"][:100], "questionable": is_questionable})
+
+        if is_questionable and bot_token and chat_id_config:
+            try:
+                pdf_bytes = generate_tender_pdf_report(row, detail, quick_flags, ai_review)
+                high_flags = [f for f in ai_review.get("flags", []) if f.get("severity") == "High"]
+                caption = (
+                    f"🚩 <b>Questionable tender flagged</b>\n"
+                    f"{row['title'][:200]}\n"
+                    f"Tender ID: {row['id']} · High-severity flags: {len(high_flags)}\n"
+                    f"{row.get('detail_url', '')}"
+                )
+                filename = f"tender_{row['id']}_report.pdf"
+                send_telegram_document_to_all(bot_token, chat_id_config, pdf_bytes, filename, caption)
+                alerted.append(row["id"])
+            except Exception as e:
+                errors.append({"id": row["id"], "stage": "pdf_or_telegram", "error": str(e)[:300]})
+
+    try:
+        github_put(GHMC_TENDER_ARCHIVE_FILE, site_token, archive, archive_sha, f"Archive {len(processed)} new area tenders", timeout=15)
+    except Exception as e:
+        errors.append({"stage": "archive_save", "error": str(e)[:300]})
+
+    return jsonify({
+        "ok": True,
+        "total_scanned": len(all_rows),
+        "area_matches_live": len(area_rows),
+        "already_archived": len(archived_ids),
+        "new_this_run": len(new_rows),
+        "processed_this_run": len(processed),
+        "still_queued_for_next_run": max(0, len(new_rows) - len(to_process)),
+        "questionable_flagged": sum(1 for p in processed if p["questionable"]),
+        "telegram_alerts_sent": len(alerted),
+        "errors": errors or None,
+    })
+
+
 @app.route('/', methods=['GET'])
 def health():
     return jsonify({"ok": True, "service": "lawsticker-ghmc-relay", "routes": [
-        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail", "/api/ghmc-tender-metadata-review",
+        "/api/ghmc-connectivity-test", "/api/ghmc-tenders-list", "/api/ghmc-tender-watch", "/api/ghmc-fetch-doc-test", "/api/ghmc-tender-detail", "/api/ghmc-tender-metadata-review", "/api/ghmc-tender-auto-pipeline",
         "(note: ghmc-tenders-list and ghmc-tender-watch now source from tenderdetail.com, not ghmc.gov.in)",
     ]})
 
