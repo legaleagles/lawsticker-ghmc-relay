@@ -351,6 +351,23 @@ PATANCHERU_AREA_KEYWORDS = (
 )
 
 
+def matches_area_keywords(title):
+    # Word-boundary matching, not naive substring - a plain "in" check on
+    # "sultanpur" incorrectly matched "Sultanpura" (a Charminar/old-city
+    # locality, nothing to do with Patancheru) since it's a substring of
+    # that unrelated name. \b only breaks between a word char and a
+    # non-word char, so it correctly excludes "Sultanpura" (word chars on
+    # both sides of the boundary) while still matching standalone
+    # "Sultanpur". Multi-word keywords like "rc puram" have spaces, which
+    # already act as natural word boundaries, so \b around the whole
+    # phrase still behaves correctly for those too.
+    title_lower = title.lower()
+    for k in PATANCHERU_AREA_KEYWORDS:
+        if re.search(r'\b' + re.escape(k) + r'\b', title_lower):
+            return True
+    return False
+
+
 def _resolve_via_doh(hostname):
     # DNS-over-HTTPS - resolves via a normal HTTPS request (port 443) instead
     # of a native OS-level DNS lookup (UDP port 53). Retries with plain
@@ -1042,7 +1059,7 @@ def ghmc_tenders_list():
         return jsonify({"ok": False, "error": f"Could not fetch tender listing: {'; '.join(fetch_errors)}"}), 500
 
     for r in all_rows:
-        r["is_patancheru_area"] = any(k in r["title"].lower() for k in PATANCHERU_AREA_KEYWORDS)
+        r["is_patancheru_area"] = matches_area_keywords(r["title"])
 
     return jsonify({
         "ok": True,
@@ -1091,7 +1108,7 @@ def ghmc_tender_watch():
     # PATANCHERU_AREA_KEYWORDS above. Everything on the page still gets
     # marked "seen" below regardless of this filter, so non-matching
     # tenders are correctly never re-checked, just never alerted on.
-    relevant_new_rows = [r for r in new_rows if any(k in r["title"].lower() for k in PATANCHERU_AREA_KEYWORDS)]
+    relevant_new_rows = [r for r in new_rows if matches_area_keywords(r["title"])]
 
     alerted = []
 
@@ -1162,7 +1179,7 @@ def ghmc_tender_auto_pipeline():
     except Exception as e:
         return jsonify({"ok": False, "error": f"Could not fetch/parse tender listing: {str(e)[:300]}"}), 500
 
-    area_rows = [r for r in all_rows if any(k in r["title"].lower() for k in PATANCHERU_AREA_KEYWORDS)]
+    area_rows = [r for r in all_rows if matches_area_keywords(r["title"])]
     # De-dupe by id across the pages fetched this run - each page should be
     # distinct in normal operation, but this is cheap insurance against
     # double-processing (and double Telegram-alerting) if any two page
