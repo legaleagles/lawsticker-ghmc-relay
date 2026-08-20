@@ -26,13 +26,14 @@ import os
 import re
 import io
 import base64
+import inspect
 import hashlib
 import urllib.request
 import urllib.error
 import ssl
 import socket as socket_mod
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pypdf import PdfReader
 
 app = Flask(__name__)
@@ -141,6 +142,63 @@ def send_telegram_document_to_all(bot_token, chat_id_config, pdf_bytes, filename
     return results
 
 
+# AI usage tracking - same shared pattern as lawsticker-backend-gcp, logging
+# to the same repo's ai-usage-log-<date>.json so both services' AI calls
+# show up in one combined daily summary/forecast rather than two separate
+# logs. See the fuller comment in lawsticker-backend-gcp/main.py for the
+# design rationale (auto-detected action via call stack, fail-silent).
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def today_ist():
+    return datetime.now(IST).date()
+
+
+GEMINI_PRICING_FALLBACK = {"input": 0.10, "output": 0.40}
+GEMINI_PRICING = {
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40},
+    "gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30},
+    "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50},
+    "gemini-3.5-flash-lite": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-2.5-pro": {"input": 1.25, "output": 10.00},
+}
+
+
+def log_ai_call(action, model, usage_metadata, site_token):
+    if not site_token or not usage_metadata:
+        return
+    try:
+        input_tokens = usage_metadata.get("promptTokenCount", 0) or 0
+        output_tokens = usage_metadata.get("candidatesTokenCount", 0) or 0
+        rates = GEMINI_PRICING.get(model, GEMINI_PRICING_FALLBACK)
+        cost = (input_tokens / 1_000_000 * rates["input"]) + (output_tokens / 1_000_000 * rates["output"])
+        record = {
+            "ts": datetime.now(IST).isoformat(),
+            "action": action or "unknown",
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": round(cost, 6),
+            "service": "ghmc-relay",
+        }
+        filename = f"ai-usage-log-{today_ist().isoformat()}.json"
+        existing, sha = github_get(filename, site_token, timeout=8)
+        records = existing if isinstance(existing, list) else []
+        records.append(record)
+        github_put(filename, site_token, records, sha, f"AI call logged: {record['action']}", timeout=10)
+    except Exception:
+        pass
+
+
+def _caller_action_name():
+    try:
+        stack = inspect.stack()
+        return stack[2].function if len(stack) > 2 else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def call_gemini_structured(api_key, prompt, schema, max_tokens=600, timeout=15):
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -158,6 +216,10 @@ def call_gemini_structured(api_key, prompt, schema, max_tokens=600, timeout=15):
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read().decode())
+    try:
+        log_ai_call(_caller_action_name(), GEMINI_MODEL, result.get("usageMetadata"), os.environ.get("SITE_REPO_TOKEN"))
+    except Exception:
+        pass
     raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(raw_text)
 
